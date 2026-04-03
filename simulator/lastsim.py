@@ -78,6 +78,11 @@ total_energy_wh   = 0        # toplam çekilen enerji (Wh)
 # Bağlantı durumu
 is_connected = False
 
+# ─── Nextion UI Durumu (sayfa değişikliğinde tekrar göndermek için) ───────────
+# DÜZELTME 1: Global durum değişkenleri eklendi
+current_nxt_status   = "NOT CONNECTED"
+current_nxt_percent  = 0
+
 # ─── ANSI Renk Kodları ────────────────────────────────────────────────────────
 
 RESET  = "\033[0m"
@@ -188,87 +193,168 @@ async def nxt_writer_loop():
         if _nxt_serial is not None:
             try:
                 _nxt_serial.write((cmd + "\xff\xff\xff").encode("latin-1"))
+                log("INFO", f"Nextion ← {cmd}")  # DÜZELTME: Debug log eklendi
             except Exception as e:
                 log("WARN", f"Nextion yazma hatası: {e}")
         await asyncio.sleep(0.010)   # 10ms: Nextion minimum komutlar arası bekleme
         _nxt_queue.task_done()
 
 
+# ─── Nextion Sayfa ID'leri ────────────────────────────────────────────────────
+# Nextion sayfaları page komutundan sonra 0x66 paketi gönderir.
+# Sayfa ID'leri Nextion Editor'daki sıraya göre tanımlanır.
+# page0=home, page1=user_info, page2=status, page3=rfid_scan
+NXT_PAGE_HOME      = 0
+NXT_PAGE_USER_INFO = 1
+NXT_PAGE_STATUS    = 2
+
+# Anlık aktif Nextion sayfasını takip eder (0x66 page change event ile güncellenir)
+_nxt_current_page = -1  # DÜZELTME: Başlangıçta -1 (bilinmiyor)
+
+
 # ─── Nextion UI Güncelleme Fonksiyonları ─────────────────────────────────────
+# DÜZELTME 2: Tüm page-qualified komutlar kaldırıldı
+# Sadece aktif sayfadaysa direkt komut gönderilir
+# Sayfa değişikliğinde nextion_read_loop() içinde tekrar çağrılır
 
 def nxt_set_time():
-    """home sayfası saat → UTC saati."""
+    """
+    Home sayfası saat güncelle.
+    Sadece home sayfası aktifken direkt komut gönderilir.
+    Sayfa değişikliğinde nextion_read_loop() içinde tekrar çağrılır.
+    """
     utc = datetime.now(TZ_UTC).strftime("%H:%M:%S")
-    nxt(f'saat.txt="{utc}"')
+    if _nxt_current_page == NXT_PAGE_HOME:
+        nxt(f'saat.txt="{utc}"')
 
 
-def nxt_set_status(status: str):
+def nxt_set_status(status: str, force: bool = False):
     """
-    home sayfası con objesi + araba görseli.
-
-    Durum → Nextion con.txt metni + con.pco rengi + araba görseli:
-      NOT CONNECTED : 63488  (kırmızı  0xF800)  — bağlantı yok
-      AVAILABLE     :  2047  (cyan     0x07FF)  — hazır, araç yok
-      CHARGING      : 11939  (yeşil    0x2EA3)  — şarj ediliyor
-      UNAVAILABLE   : 63488  (kırmızı  0xF800)  — çevrimdışı
+    Home sayfası con objesi güncelle.
+    
+    Args:
+        status: Durum metni (NOT CONNECTED, AVAILABLE, CHARGING, UNAVAILABLE)
+        force: True ise sayfa kontrolü yapılmaz (çıkış durumunda kullanılır)
+    
+    Durum global değişkende saklanır; sayfa değişikliğinde tekrar gönderilir.
     """
+    global current_nxt_status
+    current_nxt_status = status
+    
     colors = {
-        "NOT CONNECTED": 63488,   # kırmızı  0xF800
-        "AVAILABLE":      2047,   # cyan     0x07FF
-        "CHARGING":      11939,   # yeşil    0x2EA3
-        "UNAVAILABLE":   63488,   # kırmızı  0xF800
+        "NOT CONNECTED": 63488,
+        "AVAILABLE":      2047,
+        "CHARGING":      11939,
+        "UNAVAILABLE":   63488,
     }
     pic = PIC_CAR_DISCONNECTED if status in ("NOT CONNECTED", "UNAVAILABLE") else PIC_CAR_CONNECTED
     pco = colors.get(status, 63488)
-    nxt(f'con.txt="{status}"')
-    nxt(f"con.pco={pco}")
-    nxt(f"araba.pic={pic}")
+    
+    # Sadece home sayfası aktifken veya force=True ise gönder
+    if _nxt_current_page == NXT_PAGE_HOME or force:
+        nxt(f'con.txt="{status}"')
+        nxt(f"con.pco={pco}")
+        nxt(f"araba.pic={pic}")
 
 
 def nxt_set_charge_percent(pct: int):
-    """home sayfası percent → şarj yüzdesi."""
-    nxt(f'percent.txt="% {pct}"')
+    """
+    Home sayfası percent güncelle.
+    Durum global değişkende saklanır; sayfa değişikliğinde tekrar gönderilir.
+    """
+    global current_nxt_percent
+    current_nxt_percent = pct
+    if _nxt_current_page == NXT_PAGE_HOME:
+        nxt(f'percent.txt="% {pct}"')
 
 
 def nxt_set_user_id(id_tag: str):
-    """user_info sayfası id.txt → idTag (config'den okunur, her başlatmada yazılır)."""
-    nxt(f'id.txt="{id_tag}"')
+    """
+    user_info sayfası id.txt güncelle.
+    Sadece user_info sayfası aktifken direkt komut gönderilir.
+    Sayfa değişikliğinde nextion_read_loop() içinde tekrar çağrılır.
+    """
+    if _nxt_current_page == NXT_PAGE_USER_INFO:
+        nxt(f'id.txt="{id_tag}"')
 
 
 async def nextion_read_loop():
-    """Nextion'dan gelen buton olaylarını dinle (Touch Event 0x65)."""
-    loop = asyncio.get_event_loop()
-    buf  = bytearray()
+    """
+    Nextion'dan gelen olayları dinle.
+
+    İki olay tipi işlenir:
+      0x65 — Touch Event  : [0x65, page, comp, event, 0xFF, 0xFF, 0xFF]  7 byte
+      0x66 — Page Change  : [0x66, page_id,            0xFF, 0xFF, 0xFF]  5 byte
+
+    0x66 page change olayı sayesinde kullanıcının hangi sayfada olduğunu
+    biliriz ve sayfaya özgü komutlar (id.txt gibi) tam zamanında gönderilebilir.
+    """
+    global _nxt_current_page
+    buf = bytearray()
     while True:
         if _nxt_serial is None:
             await asyncio.sleep(0.1)
             continue
         try:
-            chunk = await loop.run_in_executor(None, _nxt_serial.read, 32)
-            if chunk:
-                buf.extend(chunk)
-            # 0x65 touch event paketi: [0x65, page, comp, event, 0xFF, 0xFF, 0xFF] = 7 byte
-            while len(buf) >= 7:
-                idx = buf.find(0x65)
-                if idx == -1:
-                    buf.clear()
-                    break
-                if idx > 0:
-                    del buf[:idx]
-                if len(buf) < 7:
-                    break
-                if buf[4] == 0xFF and buf[5] == 0xFF and buf[6] == 0xFF:
-                    page_id = buf[1]
-                    comp_id = buf[2]
-                    event   = buf[3]   # 0x01 = press, 0x00 = release
-                    del buf[:7]
-                    if event == 0x01:
-                        log("INFO", f"Nextion touch → page={page_id} comp={comp_id}")
-                        if comp_id == 2:   # ← useridtag butonunun component ID'si
-                            log("INFO", f"useridtag butonu → id yazılıyor: {DEFAULT_ID_TAG}")
-                            nxt_set_user_id(DEFAULT_ID_TAG)
-                else:
-                    del buf[:1]   # bozuk paket, bir byte atla
+            waiting = _nxt_serial.in_waiting
+            if waiting > 0:
+                chunk = _nxt_serial.read(waiting)
+                if chunk:
+                    buf.extend(chunk)
+
+                # Paketi işle: en az 5 byte gerekli (minimum 0x66 paketi)
+                while len(buf) >= 5:
+                    # ── 0x66 Page Change paketi: [0x66, page, 0xFF, 0xFF, 0xFF] ──
+                    if buf[0] == 0x66 and len(buf) >= 5:
+                        if buf[2] == 0xFF and buf[3] == 0xFF and buf[4] == 0xFF:
+                            new_page = buf[1]
+                            del buf[:5]
+                            
+                            # DÜZELTME 3: Sayfa değişikliğinde global durumu güncelle VE tüm verileri gönder
+                            if new_page != _nxt_current_page:
+                                log("INFO", f"Nextion sayfa değişti → page={new_page} (eski={_nxt_current_page})")
+                                _nxt_current_page = new_page
+                                
+                                # Sayfa değişikliğinde o sayfanın tüm verilerini anında güncelle
+                                if new_page == NXT_PAGE_HOME:
+                                    log("INFO", "home sayfası → saat/durum/percent yenileniyor")
+                                    nxt_set_time()
+                                    nxt_set_status(current_nxt_status)
+                                    nxt_set_charge_percent(current_nxt_percent)
+                                elif new_page == NXT_PAGE_USER_INFO:
+                                    log("INFO", f"user_info sayfası → id yazılıyor: {DEFAULT_ID_TAG}")
+                                    nxt_set_user_id(DEFAULT_ID_TAG)
+                                elif new_page == NXT_PAGE_STATUS:
+                                    log("INFO", "status sayfasına girildi → veriler yenileniyor")
+                                    nxt_update_status()
+                            continue
+                        else:
+                            del buf[:1]   # bozuk 0x66 paketi, atla
+                            continue
+
+                    # ── 0x65 Touch Event paketi: [0x65, page, comp, event, 0xFF, 0xFF, 0xFF] ──
+                    if buf[0] == 0x65:
+                        if len(buf) < 7:
+                            break   # henüz tam paket gelmedi, bekle
+                        if buf[4] == 0xFF and buf[5] == 0xFF and buf[6] == 0xFF:
+                            page_id = buf[1]
+                            comp_id = buf[2]
+                            event   = buf[3]   # 0x01 = press, 0x00 = release
+                            del buf[:7]
+                            if event == 0x01:
+                                log("INFO", f"Nextion touch → page={page_id} comp={comp_id}")
+                                if comp_id == 2:   # ← useridtag butonunun component ID'si
+                                    log("INFO", f"useridtag butonu → id yazılıyor: {DEFAULT_ID_TAG}")
+                                    nxt_set_user_id(DEFAULT_ID_TAG)
+                        else:
+                            del buf[:1]   # bozuk paket, atla
+                        continue
+
+                    # Bilinmeyen bayt → atla
+                    del buf[:1]
+            else:
+                # Bekleyen byte yok → event loop'a bırak (CPU aç)
+                await asyncio.sleep(0.02)
         except Exception as e:
             log("WARN", f"Nextion okuma hatası: {e}")
             await asyncio.sleep(0.1)
@@ -276,29 +362,26 @@ async def nextion_read_loop():
 
 def nxt_update_status():
     """
-    status sayfası güncelle:
-      power  → anlık güç (kW) = V × A / 1000, sabit
-      time   → geçen süre (HH:MM:SS), her saniye artar
-      energy → geçen_saniye × METER_INCREMENT_WH  (Wh)
-               Örnek: 10s × 500 = 5000 Wh
-      cost   → toplam ücret (TL) = (energy_wh / WH_PER_STEP) × TL_PER_500WH
-    Şarj aktif değilse son değerleri dondurur.
+    status sayfası güncelle.
+    Sadece status sayfası aktifken direkt komutlar gönderilir.
+    Sayfa değişikliğinde nextion_read_loop() içinde tekrar çağrılır.
     """
+    if _nxt_current_page != NXT_PAGE_STATUS:
+        return
+    
     power_kw = round(DEFAULT_VOLTAGE * DEFAULT_CURRENT / 1000, 2)
     nxt(f'power.txt="POWER : {power_kw} KW"')
-
+    
     if charge_start_time is not None:
-        elapsed = int(time.time() - charge_start_time)   # saniye cinsinden
+        elapsed = int(time.time() - charge_start_time)
         h = elapsed // 3600
         m = (elapsed % 3600) // 60
         s = elapsed % 60
         nxt(f'time.txt="TIME : {h:02d}:{m:02d}:{s:02d}"')
-
-        # Enerji: geçen_saniye × METER_INCREMENT_WH  (Wh)
+        
         energy_wh = elapsed * METER_INCREMENT_WH
         nxt(f'energy.txt="ENERGY: {energy_wh} Wh"')
-
-        # Ücret: her WH_PER_STEP Wh = TL_PER_500WH TL oranıyla
+        
         cost = round((energy_wh / WH_PER_STEP) * TL_PER_500WH, 2)
         nxt(f'cost.txt="COST : {cost} TL"')
     else:
@@ -394,11 +477,12 @@ async def start_transaction(ws, id_tag: str = DEFAULT_ID_TAG):
 
 async def stop_transaction(ws):
     """Şarj durdur: CSMS'e StopTransaction + konnektör 'Available' durumuna geç."""
-    global transaction_id, meter_wh, charging_active
+    global transaction_id, meter_wh, charging_active, charge_start_time
     if transaction_id is None:
         log("WARN", "Aktif işlem yok!")
         return
-    charging_active = False
+    charging_active   = False
+    charge_start_time = None   # status sayfası sıfırlansın
     await send(ws, "StopTransaction", {
         "transactionId": transaction_id,
         "idTag":         DEFAULT_ID_TAG,
@@ -406,7 +490,7 @@ async def stop_transaction(ws):
         "timestamp":     iso_now(),
         "reason":        "Local",
     })
-    # Status sayfasını dondur (son değerler kalır)
+    # Status sayfasını güncelle (son değerler kalır)
     nxt_update_status()
     log("INFO", f"Şarj durduruldu — Toplam: {total_energy_wh} Wh, {round(total_cost, 2)} TL")
     # Konnektör durumunu CSMS + Nextion'da AVAILABLE yap
@@ -470,7 +554,7 @@ async def clock_loop():
 async def status_update_loop():
     """Şarj aktifken her saniye status sayfasını güncelle."""
     while True:
-        if charging_active:
+        if charging_active or _nxt_current_page == NXT_PAGE_STATUS:
             nxt_update_status()
         await asyncio.sleep(1)
 
@@ -587,8 +671,13 @@ async def console_input(ws):
                     await status_notification(ws, 1, "Unavailable")
                 except Exception:
                     pass
-                # Nextion'ı NOT CONNECTED yap (kırmızı, araç görseli gizli)
-                nxt_set_status("NOT CONNECTED")
+                
+                # DÜZELTME 4: Çıkışta Nextion'ı home sayfasına götür, sonra güncelle
+                nxt("page home")
+                await asyncio.sleep(0.15)  # page change event'in gelmesi için bekle
+                # Şimdi home sayfasındayız, force=True ile güncelle
+                nxt_set_status("NOT CONNECTED", force=True)
+                await asyncio.sleep(0.15)  # komutların gitmesi için bekle
                 sys.exit(0)
             elif choice == "m":
                 print_menu()
@@ -612,33 +701,50 @@ async def recv_loop(ws):
 # ─── Ana Fonksiyon ────────────────────────────────────────────────────────────
 
 async def main():
-    global hb_task, is_connected, _nxt_queue
+    global hb_task, is_connected, _nxt_queue, _nxt_current_page
 
     print(f"\n{BOLD}OCPP 1.6J Simülatör · Nextion 3.5\" Entegrasyonu{RESET}")
     print(f"{DIM}Bağlanılıyor: {CSMS_URL}{RESET}\n")
 
     # ── Nextion yazma kuyruğu ve arka plan yazıcı görevi başlat ────────────
-    # Event loop içinde oluşturulmalı → main() başında initialize edilir.
     _nxt_queue = asyncio.Queue(maxsize=64)
-    asyncio.create_task(nxt_writer_loop())   # arka planda sonsuza kadar çalışır
+    asyncio.create_task(nxt_writer_loop())
 
     # Nextion portu aç
     nextion_open()
-    # Seri hattın oturması + tampon temizliğinin etkili olması için bekleme.
-    # Bu 300ms olmadan ilk komutlar hizasız gönderilip crash'e neden olabilir.
     await asyncio.sleep(0.3)
 
     # ── Başlangıç ekran durumu ──────────────────────────────────────────────
-    # user_info sayfası: config'den okunan DEFAULT_ID_TAG, her başlatmada yazılır
-    nxt_set_user_id(DEFAULT_ID_TAG)
-    # Bağlantı henüz yok → NOT CONNECTED (kırmızı)
+    # DÜZELTME 5: Nextion'ı home sayfasına zorla ve _nxt_current_page'i senkronize et
+    nxt("page home")
+    await asyncio.sleep(0.2)  # page change event'in gelip _nxt_current_page'in güncellenmesi için bekle
+    
+    # Eğer hala event gelmediyse manuel ayarla (Nextion bazen event göndermeyebilir)
+    if _nxt_current_page != NXT_PAGE_HOME:
+        log("INFO", "Nextion page event gelmedi, manuel olarak HOME sayfası ayarlanıyor")
+        _nxt_current_page = NXT_PAGE_HOME
+    
+    # Şimdi home sayfasındayız, direkt komutlar gönderebiliriz
     nxt_set_status("NOT CONNECTED")
+    await asyncio.sleep(0.05)
     nxt_set_charge_percent(0)
+    await asyncio.sleep(0.05)
     nxt_set_time()
+    await asyncio.sleep(0.05)
+    # status sayfası başlangıç değerleri (aktif değilse gönderilmez, sorun değil)
+    nxt_update_status()
+    await asyncio.sleep(0.3)
 
     def handle_sigint(*_):
         log("INFO", "Ctrl+C — bağlantı kesiliyor...")
-        nxt_set_status("NOT CONNECTED")
+        if _nxt_serial is not None:
+            # DÜZELTME 6: SIGINT handler'da doğrudan seri porta yaz (kuyruk kullanmadan)
+            try:
+                for cmd in ['page home', 'con.txt="NOT CONNECTED"', 'con.pco=63488', f'araba.pic={PIC_CAR_DISCONNECTED}']:
+                    _nxt_serial.write((cmd + "\xff\xff\xff").encode("latin-1"))
+                    time.sleep(0.02)
+            except Exception:
+                pass
         sys.exit(0)
     signal.signal(signal.SIGINT, handle_sigint)
 
@@ -657,9 +763,6 @@ async def main():
             log("INFO", f"Bağlandı ✓  ({CSMS_URL})")
 
             # WebSocket bağlandı → BootNotification gönder.
-            # BootNotification yanıtı (Accepted) gelince handle_message içinde
-            # StatusNotification(Available) otomatik gönderilir ve Nextion
-            # AVAILABLE (cyan, 2047) durumuna geçer.
             await boot_notification(ws)
 
             # Paralel görevler
@@ -674,10 +777,10 @@ async def main():
     except OSError as e:
         log("ERR", f"Bağlantı başarısız: {e}")
         log("INFO", "CSMS çalışıyor mu? URL doğru mu?")
-        nxt_set_status("NOT CONNECTED")
+        nxt_set_status("NOT CONNECTED", force=True)
     except Exception as e:
         log("ERR", f"Beklenmeyen hata: {e}")
-        nxt_set_status("NOT CONNECTED")
+        nxt_set_status("NOT CONNECTED", force=True)
 
 
 # ─── Giriş Noktası ────────────────────────────────────────────────────────────
