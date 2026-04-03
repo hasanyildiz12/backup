@@ -2,8 +2,13 @@
 """
 ocpp-charge-point-simulator — OCPP 1.6J + Nextion 3.5" Entegrasyonu
 =====================================================================
-Raspberry Pi 3B+ · GPIO 14/15 (UART) · /dev/ttyS0 · 9600 baud
+Raspberry Pi Zero 2W · GPIO 14/15 (UART) · /dev/ttyAMA0 · 9600 baud
 Nextion sayfaları: home, user_info, status, rfid_scan
+
+NFC Kimlik Doğrulama:
+  Simülatör başlamadan önce PN532 I2C NFC okuyucu ile kart doğrulanır.
+  config/__init__.py içindeki NFC_ALLOWED_ID ile eşleşen kart
+  okutulduğunda simülasyon başlar.
 """
 
 import asyncio
@@ -11,8 +16,7 @@ import json
 import signal
 import sys
 import time
-from datetime import datetime, timezone, timedelta
-import base64
+from datetime import datetime, timezone
 
 TZ_UTC = timezone.utc
 
@@ -35,6 +39,7 @@ from config import (
     CSMS_URL,
     CHARGE_BOX_ID,
     DEFAULT_ID_TAG,
+    NFC_ALLOWED_ID,
     VENDOR, MODEL, SERIAL, FIRMWARE,
     HEARTBEAT_INTERVAL,
     METER_INCREMENT_WH,
@@ -52,6 +57,8 @@ from config import (
     PERCENT_PER_STEP,
     TL_PER_500WH,
 )
+
+import base64
 
 # ─── Runtime State ────────────────────────────────────────────────────────────
 
@@ -92,9 +99,49 @@ def log(direction: str, msg: str):
     print(f"{DIM}{_ts()}{RESET}  {c}{BOLD}{direction:<4}{RESET}  {msg}")
 
 
+# ─── NFC Kimlik Doğrulama ─────────────────────────────────────────────────────
+
+def wait_for_nfc_auth():
+    """
+    BootNotification gönderilmeden önce NFC kart doğrulaması.
+
+    PN532 (I2C) üzerinden kart okur. config/__init__.py içindeki
+    NFC_ALLOWED_ID ile eşleşen kart okutulana kadar simülasyon başlamaz.
+    Yanlış kart okutulursa uyarı verir ve tekrar bekler.
+    Ctrl+C ile çıkılabilir.
+    """
+    from nfc_read import init_pn532, read_uid
+
+    print(f"\n{BOLD}{CYAN}╔══════════════════════════════════════╗{RESET}")
+    print(f"{BOLD}{CYAN}║     NFC Kimlik Doğrulama             ║{RESET}")
+    print(f"{BOLD}{CYAN}╚══════════════════════════════════════╝{RESET}")
+    print(f"{DIM}İzin verilen kart UID : {NFC_ALLOWED_ID}{RESET}")
+    print(f"{YELLOW}Kartı okuyucuya yaklaştırın...{RESET}\n")
+
+    init_pn532()
+
+    while True:
+        try:
+            uid = read_uid()
+            if uid:
+                uid_str = uid.hex().upper()
+                if uid_str == NFC_ALLOWED_ID:
+                    print(f"{GREEN}{BOLD}✓ Kart onaylandı  : {uid_str}{RESET}")
+                    print(f"{GREEN}  Simülasyon başlıyor...{RESET}\n")
+                    return  # Doğrulama başarılı → simülasyon devam eder
+                else:
+                    print(f"{RED}✗ Geçersiz kart   : {uid_str}  —  Tekrar deneyin{RESET}")
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}Çıkış yapılıyor...{RESET}")
+            sys.exit(0)
+
+
 # ─── Nextion Serial Bağlantısı ────────────────────────────────────────────────
 
 _nxt_serial = None
+_nxt_queue = None   # Nextion yazma kuyruğu (event loop icinde init edilir)
+
 
 def nextion_open():
     """Serial portu aç. Hata olursa uyar ama çökme."""
@@ -105,6 +152,9 @@ def nextion_open():
             NEXTION_BAUDRATE,
             timeout=0.1
         )
+        # Önceki oturumdan kalan UART tamponunu temizle (crash önleme)
+        _nxt_serial.reset_input_buffer()
+        _nxt_serial.reset_output_buffer()
         log("INFO", f"Nextion bağlandı → {NEXTION_PORT} @ {NEXTION_BAUDRATE}")
     except Exception as e:
         log("WARN", f"Nextion açılamadı: {e} — ekran komutları devre dışı")
@@ -112,13 +162,36 @@ def nextion_open():
 
 
 def nxt(cmd: str):
-    """Nextion'a komut gönder. Her komut \xff\xff\xff ile biter."""
-    if _nxt_serial is None:
+    """
+    Nextion komutunu yazma kuyruğuna ekle (non-blocking).
+    Fiili yazma nxt_writer_loop() tarafından yapılır; komutlar arası 10ms
+    gecikme ile seri portu ve Nextion tamponu taşmaz.
+    """
+    if _nxt_serial is None or _nxt_queue is None:
         return
     try:
-        _nxt_serial.write((cmd + "\xff\xff\xff").encode("latin-1"))
-    except Exception as e:
-        log("WARN", f"Nextion yazma hatası: {e}")
+        _nxt_queue.put_nowait(cmd)
+    except Exception:
+        pass  # kuyruk dolu veya event loop yok — komutu sessizce at
+
+
+async def nxt_writer_loop():
+    """
+    Nextion seri yazma görevi (arka plan).
+
+    Kuyruktaki komutları sırayla alır, seri porta yazar ve her yazma
+    sonrasında 10ms bekler. Bu bekleme Nextion'ın 128-byte UART tamponunun
+    taşmasını ve ekranın donup çökmesini önler.
+    """
+    while True:
+        cmd = await _nxt_queue.get()
+        if _nxt_serial is not None:
+            try:
+                _nxt_serial.write((cmd + "\xff\xff\xff").encode("latin-1"))
+            except Exception as e:
+                log("WARN", f"Nextion yazma hatası: {e}")
+        await asyncio.sleep(0.010)   # 10ms: Nextion minimum komutlar arası bekleme
+        _nxt_queue.task_done()
 
 
 # ─── Nextion UI Güncelleme Fonksiyonları ─────────────────────────────────────
@@ -132,15 +205,20 @@ def nxt_set_time():
 def nxt_set_status(status: str):
     """
     home sayfası con objesi + araba görseli.
-    status: 'NOT CONNECTED' | 'CONNECTED' | 'AVAILABLE' | 'CHARGING'
+
+    Durum → Nextion con.txt metni + con.pco rengi + araba görseli:
+      NOT CONNECTED : 63488  (kırmızı  0xF800)  — bağlantı yok
+      AVAILABLE     :  2047  (cyan     0x07FF)  — hazır, araç yok
+      CHARGING      : 11939  (yeşil    0x2EA3)  — şarj ediliyor
+      UNAVAILABLE   : 63488  (kırmızı  0xF800)  — çevrimdışı
     """
     colors = {
         "NOT CONNECTED": 63488,   # kırmızı  0xF800
-        "CONNECTED":     11939,    # yeşil    0x0400
-        "AVAILABLE":     11939,    # açık yeşil 0x07E0
-        "CHARGING":      2047,    # cyan     0x07FF
+        "AVAILABLE":      2047,   # cyan     0x07FF
+        "CHARGING":      11939,   # yeşil    0x2EA3
+        "UNAVAILABLE":   63488,   # kırmızı  0xF800
     }
-    pic = PIC_CAR_CONNECTED if status != "NOT CONNECTED" else PIC_CAR_DISCONNECTED
+    pic = PIC_CAR_DISCONNECTED if status in ("NOT CONNECTED", "UNAVAILABLE") else PIC_CAR_CONNECTED
     pco = colors.get(status, 63488)
     nxt(f'con.txt="{status}"')
     nxt(f"con.pco={pco}")
@@ -153,7 +231,7 @@ def nxt_set_charge_percent(pct: int):
 
 
 def nxt_set_user_id(id_tag: str):
-    """user_info sayfası id → idTag."""
+    """user_info sayfası id.txt → idTag (config'den okunur, her başlatmada yazılır)."""
     nxt(f'id.txt="{id_tag}"')
 
 
@@ -186,8 +264,6 @@ async def nextion_read_loop():
                     del buf[:7]
                     if event == 0x01:
                         log("INFO", f"Nextion touch → page={page_id} comp={comp_id}")
-                        # useridtag butonu: hangi sayfada / component ise buraya düş
-                        # Nextion Editor'da butonun "id" değerine göre comp_id'yi eşle
                         if comp_id == 2:   # ← useridtag butonunun component ID'si
                             log("INFO", f"useridtag butonu → id yazılıyor: {DEFAULT_ID_TAG}")
                             nxt_set_user_id(DEFAULT_ID_TAG)
@@ -203,30 +279,31 @@ def nxt_update_status():
     status sayfası güncelle:
       power  → anlık güç (kW) = V × A / 1000, sabit
       time   → geçen süre (HH:MM:SS), her saniye artar
-      energy → toplam çekilen enerji (kWh) = kW × geçen_saat, gerçek zamanlı
-      cost   → toplam ücret (TL)
+      energy → geçen_saniye × METER_INCREMENT_WH  (Wh)
+               Örnek: 10s × 500 = 5000 Wh
+      cost   → toplam ücret (TL) = (energy_wh / WH_PER_STEP) × TL_PER_500WH
     Şarj aktif değilse son değerleri dondurur.
     """
     power_kw = round(DEFAULT_VOLTAGE * DEFAULT_CURRENT / 1000, 2)
     nxt(f'power.txt="POWER : {power_kw} KW"')
 
     if charge_start_time is not None:
-        elapsed = int(time.time() - charge_start_time)
+        elapsed = int(time.time() - charge_start_time)   # saniye cinsinden
         h = elapsed // 3600
         m = (elapsed % 3600) // 60
         s = elapsed % 60
         nxt(f'time.txt="TIME : {h:02d}:{m:02d}:{s:02d}"')
 
-        # Enerji: kW × geçen süre (saat cinsinden) — gerçek zamanlı
-        energy_kwh = round(power_kw * elapsed / 3600, 4)
-        nxt(f'energy.txt="ENERGY: {energy_kwh} kWh"')
+        # Enerji: geçen_saniye × METER_INCREMENT_WH  (Wh)
+        energy_wh = elapsed * METER_INCREMENT_WH
+        nxt(f'energy.txt="ENERGY: {energy_wh} Wh"')
 
-        # Ücret: her 500 Wh = 5 TL oranıyla gerçek zamanlı
-        cost = round((energy_kwh * 1000 / WH_PER_STEP) * TL_PER_500WH, 2)
+        # Ücret: her WH_PER_STEP Wh = TL_PER_500WH TL oranıyla
+        cost = round((energy_wh / WH_PER_STEP) * TL_PER_500WH, 2)
         nxt(f'cost.txt="COST : {cost} TL"')
     else:
         nxt('time.txt="TIME : 00:00:00"')
-        nxt('energy.txt="ENERGY: 0.0000 kWh"')
+        nxt('energy.txt="ENERGY: 0 Wh"')
         nxt('cost.txt="COST : 0.00 TL"')
 
 
@@ -275,14 +352,20 @@ async def heartbeat(ws):
 
 
 async def status_notification(ws, connector_id: int, status: str, error_code: str = "NoError"):
+    """
+    CSMS'e StatusNotification gönderir ve Nextion'ı günceller.
+    connector_id=0 → charge point seviyesi
+    connector_id=1 → konnektör 1
+    """
     await send(ws, "StatusNotification", {
         "connectorId": connector_id,
         "status":      status,
         "errorCode":   error_code,
         "timestamp":   iso_now(),
     })
-    # Nextion con objesini OCPP status ile güncelle
-    nxt_set_status(status.upper())
+    # Konnektör 1 için Nextion con objesini güncelle
+    if connector_id == 1:
+        nxt_set_status(status.upper())
 
 
 async def authorize(ws, id_tag: str = DEFAULT_ID_TAG):
@@ -290,6 +373,7 @@ async def authorize(ws, id_tag: str = DEFAULT_ID_TAG):
 
 
 async def start_transaction(ws, id_tag: str = DEFAULT_ID_TAG):
+    """Şarj başlat: CSMS'e StartTransaction + konnektör 'Charging' durumuna geç."""
     global meter_wh, charging_active, charge_start_time, charge_percent
     global total_energy_wh, total_cost
     charge_start_time = time.time()
@@ -304,9 +388,12 @@ async def start_transaction(ws, id_tag: str = DEFAULT_ID_TAG):
         "meterStart":  meter_wh,
         "timestamp":   iso_now(),
     })
+    # Konnektör durumunu CSMS + Nextion'da CHARGING yap
+    await status_notification(ws, 1, "Charging")
 
 
 async def stop_transaction(ws):
+    """Şarj durdur: CSMS'e StopTransaction + konnektör 'Available' durumuna geç."""
     global transaction_id, meter_wh, charging_active
     if transaction_id is None:
         log("WARN", "Aktif işlem yok!")
@@ -321,7 +408,9 @@ async def stop_transaction(ws):
     })
     # Status sayfasını dondur (son değerler kalır)
     nxt_update_status()
-    log("INFO", f"Şarj durduruldu — Toplam: {total_energy_wh} Wh, {round(total_cost,2)} TL")
+    log("INFO", f"Şarj durduruldu — Toplam: {total_energy_wh} Wh, {round(total_cost, 2)} TL")
+    # Konnektör durumunu CSMS + Nextion'da AVAILABLE yap
+    await status_notification(ws, 1, "Available")
 
 
 async def meter_values(ws):
@@ -404,7 +493,7 @@ async def handle_message(ws, raw: str):
         payload = msg[2]
         log("RECV", f"[Response/{mid}] {payload}")
 
-        # BootNotification → heartbeat aralığı güncelle
+        # BootNotification → heartbeat aralığı güncelle + konnektör durumu bildir
         if "interval" in payload and "status" in payload:
             status   = payload["status"]
             interval = payload.get("interval", hb_interval)
@@ -414,6 +503,12 @@ async def handle_message(ws, raw: str):
                 if hb_task:
                     hb_task.cancel()
                 hb_task = asyncio.create_task(heartbeat_loop(ws, hb_interval))
+
+                # BootNotification kabul edildi:
+                # → Charge Point (connector 0) + Konnektör 1 → AVAILABLE
+                asyncio.create_task(status_notification(ws, 0, "Available"))
+                asyncio.create_task(status_notification(ws, 1, "Available"))
+                log("INFO", "Konnektör → AVAILABLE (CSMS + Nextion güncellendi)")
 
         # StartTransaction → transactionId kaydet
         if "transactionId" in payload:
@@ -457,7 +552,7 @@ def print_menu():
   {BOLD}7{RESET}  MeterValues        [+500 Wh, +%5]
   {BOLD}8{RESET}  StopTransaction    [şarjı durdur]
   {BOLD}m{RESET}  Menüyü göster
-  {BOLD}q{RESET}  Çıkış
+  {BOLD}q{RESET}  Çıkış (konnektör → NOT CONNECTED)
 """)
 
 
@@ -486,7 +581,13 @@ async def console_input(ws):
             elif choice == "8":
                 await stop_transaction(ws)
             elif choice in ("q", "quit", "exit"):
-                log("INFO", "Çıkılıyor...")
+                log("INFO", "Çıkılıyor — konnektör NOT CONNECTED yapılıyor...")
+                # CSMS'e Unavailable bildir (bağlantı henüz açık)
+                try:
+                    await status_notification(ws, 1, "Unavailable")
+                except Exception:
+                    pass
+                # Nextion'ı NOT CONNECTED yap (kırmızı, araç görseli gizli)
                 nxt_set_status("NOT CONNECTED")
                 sys.exit(0)
             elif choice == "m":
@@ -511,15 +612,26 @@ async def recv_loop(ws):
 # ─── Ana Fonksiyon ────────────────────────────────────────────────────────────
 
 async def main():
-    global hb_task, is_connected
+    global hb_task, is_connected, _nxt_queue
 
     print(f"\n{BOLD}OCPP 1.6J Simülatör · Nextion 3.5\" Entegrasyonu{RESET}")
     print(f"{DIM}Bağlanılıyor: {CSMS_URL}{RESET}\n")
 
+    # ── Nextion yazma kuyruğu ve arka plan yazıcı görevi başlat ────────────
+    # Event loop içinde oluşturulmalı → main() başında initialize edilir.
+    _nxt_queue = asyncio.Queue(maxsize=64)
+    asyncio.create_task(nxt_writer_loop())   # arka planda sonsuza kadar çalışır
+
     # Nextion portu aç
     nextion_open()
+    # Seri hattın oturması + tampon temizliğinin etkili olması için bekleme.
+    # Bu 300ms olmadan ilk komutlar hizasız gönderilip crash'e neden olabilir.
+    await asyncio.sleep(0.3)
 
-    # Başlangıç ekran durumu
+    # ── Başlangıç ekran durumu ──────────────────────────────────────────────
+    # user_info sayfası: config'den okunan DEFAULT_ID_TAG, her başlatmada yazılır
+    nxt_set_user_id(DEFAULT_ID_TAG)
+    # Bağlantı henüz yok → NOT CONNECTED (kırmızı)
     nxt_set_status("NOT CONNECTED")
     nxt_set_charge_percent(0)
     nxt_set_time()
@@ -544,11 +656,10 @@ async def main():
             is_connected = True
             log("INFO", f"Bağlandı ✓  ({CSMS_URL})")
 
-            # Nextion'ı güncelle — bağlantı kurulunca otomatik
-            nxt_set_status("CONNECTED")
-            nxt_set_user_id(DEFAULT_ID_TAG)   # user_info sayfası id objesi kalıcı yazılır
-
-            # Otomatik BootNotification
+            # WebSocket bağlandı → BootNotification gönder.
+            # BootNotification yanıtı (Accepted) gelince handle_message içinde
+            # StatusNotification(Available) otomatik gönderilir ve Nextion
+            # AVAILABLE (cyan, 2047) durumuna geçer.
             await boot_notification(ws)
 
             # Paralel görevler
@@ -572,4 +683,7 @@ async def main():
 # ─── Giriş Noktası ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # 1. NFC kart doğrulaması — geçerli kart okutulana kadar bloke eder
+    wait_for_nfc_auth()
+    # 2. Doğrulama başarılı → OCPP simülatörünü başlat
     asyncio.run(main())

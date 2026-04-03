@@ -22,6 +22,12 @@ DEFAULT_ID_TAG      = "hasanyildizidtag"
 BASIC_AUTH_USER     = "CP-1"
 BASIC_AUTH_PASSWORD = "1234567890asdfgh"
 
+# ─── NFC Authentication ──────────────────────────────────────────────────────
+# Simülatör başlamadan önce NFC kart doğrulaması aktiftir.
+# Sadece NFC_ALLOWED_ID ile eşleşen kart okutulduğunda simülasyon başlar.
+
+NFC_ALLOWED_ID = "97350E07"   # İzin verilen NFC kart UID (büyük harf, boşluksuz)
+
 # ─── Heartbeat ───────────────────────────────────────────────────────────────
 
 HEARTBEAT_INTERVAL = 30  # seconds (overridden by BootNotification response)
@@ -51,6 +57,12 @@ NEXTION_BAUDRATE = 9600
 PIC_CAR_CONNECTED    = 0
 PIC_CAR_DISCONNECTED = 3
 PIC_RFID_FRAMES      = [5, 6, 7]
+
+# ─── Nextion Renk Kodları (RGB565) ───────────────────────────────────────────
+# con.pco renk değerleri:
+#   NOT CONNECTED  → 63488   (kırmızı   0xF800)
+#   AVAILABLE      →  2047   (cyan      0x07FF)
+#   CHARGING       → 11939   (yeşil     0x2EA3)
 
 # ─── Şarj / Ücretlendirme ────────────────────────────────────────────────────
 # 500 Wh  → %5 şarj artışı
